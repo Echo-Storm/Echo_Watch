@@ -8,10 +8,10 @@ A small PyQt6 desktop app: press **Check all** once a day and see what changed.
 - **GitHub releases** - flags a new tag since you last marked it seen.
 - **GitHub commits** - shows the newest commit and how many are new since you last marked it seen.
 
-- **Scan AddOns** - pick an AddOns folder (retail, classic or a beta client) and every addon Wago
+- **Scan AddOns** - scans the AddOns folder saved in **Settings** (retail, classic or a beta client) and adds every addon Wago
   knows about is added automatically. It uses the `X-Wago-ID` from the `.toc` when present.
 - **Update all** installs every outdated addon. A failed install is rolled back from the backup.
-- **Check on launch** runs the check as soon as the app opens.
+- **Check on launch** (Settings) runs the check as soon as the app opens.
 
 Every item has a display name you can rename. First check of a release/commit item sets a silent
 baseline; use **Mark seen** to clear a "New" flag.
@@ -25,7 +25,7 @@ python echo_watch.py --check  # check immediately on launch
 ```
 
 Config lives in `%LOCALAPPDATA%\EchoWatch\config.json`; addon backups in `...\EchoWatch\backups`.
-Set the AddOns folder with the **AddOns folder...** button (default is the WoW classic beta folder).
+Set the AddOns folder under **Settings...** (default is the WoW classic beta folder).
 
 GitHub lookups use `GH_TOKEN`/`GITHUB_TOKEN` or `gh auth token` if available, otherwise the 60/hour
 anonymous limit applies. `python smoke_test.py` checks the network sources.

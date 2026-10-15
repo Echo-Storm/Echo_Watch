@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import webbrowser
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -196,6 +197,56 @@ class AddDialog(QDialog):
         return it
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(560)
+        self.path = QLineEdit(cfg["addons_dir"])
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse)
+        row = QHBoxLayout()
+        row.addWidget(self.path, 1)
+        row.addWidget(browse)
+        self.launch = QCheckBox("Check for updates when the app opens")
+        self.launch.setChecked(bool(cfg.get("check_on_launch")))
+        self.status = QLabel()
+        self.status.setObjectName("sub")
+        self.path.textChanged.connect(self._validate)
+        form = QFormLayout()
+        form.addRow("WoW AddOns folder", row)
+        form.addRow("", self.status)
+        form.addRow("", self.launch)
+        hint = QLabel("Point this at the Interface/AddOns folder of the client you play (retail, classic, "
+                      "or a beta such as _classic_beta_). It is saved; Scan and Update use it every time.")
+        hint.setObjectName("sub")
+        hint.setWordWrap(True)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(hint)
+        lay.addWidget(bb)
+        self._validate()
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "WoW AddOns folder", self.path.text())
+        if d:
+            self.path.setText(d.replace("/", "\\"))
+
+    def _validate(self):
+        p = Path(self.path.text().strip())
+        if p.is_dir():
+            n = sum(1 for d in p.iterdir() if d.is_dir() and (d / f"{d.name}.toc").exists())
+            self.status.setText(f"✔  Found - {n} addon folder(s)")
+        else:
+            self.status.setText("✖  Folder not found")
+
+    def values(self):
+        return self.path.text().strip(), self.launch.isChecked()
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -210,9 +261,6 @@ class Main(QMainWindow):
         title.setObjectName("title")
         self.sub = QLabel("")
         self.sub.setObjectName("sub")
-        self.chk_launch = QCheckBox("Check on launch")
-        self.chk_launch.setChecked(bool(self.cfg.get("check_on_launch")))
-        self.chk_launch.toggled.connect(self.set_launch)
         self.btn_check = QPushButton("Check all")
         self.btn_check.setObjectName("primary")
         self.btn_check.clicked.connect(self.check_all)
@@ -222,8 +270,6 @@ class Main(QMainWindow):
         tcol.addWidget(self.sub)
         head.addLayout(tcol)
         head.addStretch()
-        head.addWidget(self.chk_launch)
-        head.addSpacing(12)
         head.addWidget(self.btn_check)
 
         self.table = QTableWidget(0, len(COLS))
@@ -248,12 +294,12 @@ class Main(QMainWindow):
         self.btn_scan = QPushButton("Scan AddOns")
         self.btn_edit = QPushButton("Rename / edit...")
         self.btn_remove = QPushButton("Remove")
-        self.btn_dir = QPushButton("AddOns folder...")
+        self.btn_dir = QPushButton("Settings...")
         for b, fn in ((self.btn_open, self.open_page), (self.btn_update, self.update_now),
                       (self.btn_update_all, self.update_all), (self.btn_seen, self.mark_seen),
                       (self.btn_add, self.add_item), (self.btn_scan, self.scan_addons),
                       (self.btn_edit, self.edit_item), (self.btn_remove, self.remove_item),
-                      (self.btn_dir, self.pick_dir)):
+                      (self.btn_dir, self.open_settings)):
             b.clicked.connect(fn)
         bar = QHBoxLayout()
         for b in (self.btn_open, self.btn_update, self.btn_update_all, self.btn_seen):
@@ -280,10 +326,6 @@ class Main(QMainWindow):
 
     def save(self):
         store.save(self.cfg)
-
-    def set_launch(self, on):
-        self.cfg["check_on_launch"] = on
-        self.save()
 
     def row_of(self, ref):
         return next((i for i, x in enumerate(self.items()) if x is ref), None)
@@ -507,22 +549,19 @@ class Main(QMainWindow):
             self.reload_table()
             self._buttons()
 
-    def pick_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "WoW AddOns folder", self.cfg["addons_dir"])
-        if d:
-            self.cfg["addons_dir"] = d
+    def open_settings(self):
+        d = SettingsDialog(self.cfg, self)
+        if d.exec():
+            self.cfg["addons_dir"], self.cfg["check_on_launch"] = d.values()
             self.save()
             self.reload_table()
+            self._buttons()
 
     def scan_addons(self):
-        d = QFileDialog.getExistingDirectory(
-            self, "Pick the AddOns folder to scan (retail, classic, or beta)", self.cfg["addons_dir"])
-        if not d:
-            return
-        if d != self.cfg["addons_dir"]:
-            self.cfg["addons_dir"] = d
-            self.save()
-            self.reload_table()
+        if not Path(self.cfg["addons_dir"]).is_dir():
+            QMessageBox.information(self, "AddOns folder", "The saved AddOns folder doesn't exist. "
+                                    "Set the right one in Settings first.")
+            return self.open_settings()
         known = [i["folder"] for i in self.items() if i["kind"] == "wago"]
         slugs = [i["slug"] for i in self.items() if i["kind"] == "wago"]
         job = ScanJob(self.cfg["addons_dir"], known, slugs)
