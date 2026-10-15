@@ -594,7 +594,20 @@ class Main(QMainWindow):
         self.statusBar().showMessage(msg + (f"; {misses} folder(s) not on Wago were skipped." if misses else "."), 12000)
 
 
+def _log_crash(exc_type, exc, tb):
+    """pythonw has no console, so write startup/runtime crashes to a file."""
+    import traceback
+    store.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    (store.DATA_DIR / "error.log").write_text(text, encoding="utf-8")
+    try:
+        QMessageBox.critical(None, "Echo Watch crashed", f"{exc}\n\nDetails: {store.DATA_DIR / 'error.log'}")
+    except Exception:
+        pass
+
+
 def main():
+    sys.excepthook = _log_crash
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     w = Main()
