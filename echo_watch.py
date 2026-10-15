@@ -5,11 +5,11 @@ import time
 import webbrowser
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-                             QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                             QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                              QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
                              QWidget)
 
@@ -27,22 +27,31 @@ STYLE = """
 * { font-family: 'Segoe UI'; font-size: 13px; color: #d8dee9; }
 QMainWindow, QDialog { background: #14171c; }
 QLabel#title { font-size: 22px; font-weight: 600; color: #ffffff; }
-QLabel#sub { color: #7f8896; }
-QTableWidget { background: #1a1e25; border: 1px solid #262c36; border-radius: 8px;
-               gridline-color: transparent; selection-background-color: #243447; }
-QHeaderView::section { background: #14171c; color: #7f8896; border: none; padding: 6px; }
-QPushButton { background: #232a35; border: 1px solid #2f3846; border-radius: 6px; padding: 7px 14px; }
-QPushButton:hover { background: #2b3441; }
-QPushButton:disabled { color: #566070; background: #1b2028; }
-QPushButton#primary { background: #2fb5a8; color: #0b1114; border: none; font-weight: 600; padding: 9px 22px; }
+QLabel#sub { color: #6f7885; }
+QTableWidget { background: transparent; border: none; outline: 0; }
+QTableWidget::item { padding: 0 18px; border: none; border-bottom: 1px solid #1d222a; }
+QTableWidget::item:selected { background: #1c2632; }
+QHeaderView::section { background: transparent; color: #5d6674; border: none;
+                       border-bottom: 1px solid #262c36; padding: 10px 18px; font-size: 11px; }
+QPushButton { background: transparent; border: 1px solid #2a3240; border-radius: 6px; padding: 7px 16px; }
+QPushButton:hover { background: #222a35; }
+QPushButton:disabled { color: #4a5360; border-color: #212731; }
+QPushButton#primary { background: #2fb5a8; color: #0b1114; border: none; font-weight: 600; padding: 9px 24px; }
 QPushButton#primary:hover { background: #3fcabc; }
 QPushButton#primary:disabled { background: #25544f; color: #0b1114; }
+QPushButton#accent { border-color: #2fb5a8; color: #5fd3c6; }
+QPushButton#accent:hover { background: #17302f; }
+QPushButton#accent:disabled { border-color: #212731; color: #4a5360; }
 QLineEdit, QComboBox { background: #1a1e25; border: 1px solid #2f3846; border-radius: 6px; padding: 6px; }
-QStatusBar { color: #7f8896; }
+QMenu { background: #1a1e25; border: 1px solid #2f3846; padding: 4px; }
+QMenu::item { padding: 6px 22px; border-radius: 4px; }
+QMenu::item:selected { background: #243447; }
+QMenu::item:disabled { color: #4a5360; }
+QStatusBar { color: #6f7885; }
 """
 
 GOOD, WARN, BAD, MUTED = QColor("#5fd39a"), QColor("#f0b44c"), QColor("#ef6b6b"), QColor("#7f8896")
-COLS = ["Name", "Type", "Current", "New", "Status", "What changed"]
+COLS = ["NAME", "VERSION", "STATUS", "WHAT CHANGED"]
 
 
 def apply_result(it, res):
@@ -290,38 +299,42 @@ class Main(QMainWindow):
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.verticalHeader().setDefaultSectionSize(42)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # no dotted focus box on cells
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.row_menu)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hh.setHighlightSections(False)
+        for c, w in ((0, 260), (1, 200), (2, 180)):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(c, w)
         hh.setSectionResizeMode(len(COLS) - 1, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(self._buttons)
         self.table.doubleClicked.connect(lambda: self.edit_item())
 
-        self.btn_open = QPushButton("Open page")
         self.btn_update = QPushButton("Update now")
         self.btn_update_all = QPushButton("Update all")
-        self.btn_seen = QPushButton("Mark seen")
+        for b_ in (self.btn_update, self.btn_update_all):
+            b_.setObjectName("accent")
         self.btn_add = QPushButton("Add...")
         self.btn_scan = QPushButton("Scan AddOns")
-        self.btn_edit = QPushButton("Rename / edit...")
-        self.btn_remove = QPushButton("Remove")
         self.btn_dir = QPushButton("Settings...")
-        for b, fn in ((self.btn_open, self.open_page), (self.btn_update, self.update_now),
-                      (self.btn_update_all, self.update_all), (self.btn_seen, self.mark_seen),
-                      (self.btn_add, self.add_item), (self.btn_scan, self.scan_addons),
-                      (self.btn_edit, self.edit_item), (self.btn_remove, self.remove_item),
-                      (self.btn_dir, self.open_settings)):
-            b.clicked.connect(fn)
+        for b_, fn in ((self.btn_update, self.update_now), (self.btn_update_all, self.update_all),
+                       (self.btn_add, self.add_item), (self.btn_scan, self.scan_addons),
+                       (self.btn_dir, self.open_settings)):
+            b_.clicked.connect(fn)
         bar = QHBoxLayout()
-        for b in (self.btn_open, self.btn_update, self.btn_update_all, self.btn_seen):
-            bar.addWidget(b)
+        bar.setSpacing(8)
+        bar.addWidget(self.btn_update)
+        bar.addWidget(self.btn_update_all)
         bar.addStretch()
-        for b in (self.btn_add, self.btn_scan, self.btn_edit, self.btn_remove, self.btn_dir):
-            bar.addWidget(b)
+        for b_ in (self.btn_add, self.btn_scan, self.btn_dir):
+            bar.addWidget(b_)
 
         root = QWidget()
         lay = QVBoxLayout(root)
@@ -377,27 +390,58 @@ class Main(QMainWindow):
         for r in range(len(self.items())):
             self.render_row(r)
         last = self.cfg.get("last_check")
-        self.sub.setText("Last checked " + time.strftime("%a %b %d, %H:%M", time.localtime(last))
-                         if last else "Never checked - press Check all")
+        self.sub.setText(("Last checked " + time.strftime("%a %b %d, %H:%M", time.localtime(last))
+                          if last else "Never checked") + "   \u00B7   right-click a row for more")
 
     def render_row(self, r):
         it = self.items()[r]
         text, color, _ = self.status(it)
+        calm = text in ("Up to date", "Not checked")
+        have, latest = self.have(it), it.get("latest")
+        if calm or not latest:
+            version = have or "\u2014"
+        else:
+            version = f"{have or 'none'}  \u2192  {latest}"
         detail = it.get("error") or it.get("note") or ""
-        icon = STATUS_ICON.get(text, "●")
-        newer = text not in ("Up to date", "Not checked", "Check failed")
-        vals = [it["name"], f"{KIND_ICON[it['kind']]}  {KINDS[it['kind']]}", self.have(it) or "-",
-                (it.get("latest") or "-") if newer else "-", f"{icon}  {text}", detail]
+        vals = [f"{KIND_ICON[it['kind']]}   {it['name']}", version,
+                f"{STATUS_ICON.get(text, chr(0x25CF))}  {text}", detail]
         for c, v in enumerate(vals):
             cell = QTableWidgetItem(v)
-            if c == 4:
+            cell.setToolTip(f"{KINDS[it['kind']]}\n{detail}" if c == 0 else v)
+            if c == 1 and calm:
+                cell.setForeground(MUTED)
+            if c == 2:
                 cell.setForeground(color)
-                f = QFont()
-                f.setBold(True)
-                cell.setFont(f)
-            elif c == 5:
+                if not calm:
+                    f = QFont()
+                    f.setBold(True)
+                    cell.setFont(f)
+            elif c == 3:
                 cell.setForeground(MUTED)
             self.table.setItem(r, c, cell)
+
+    def row_menu(self, pos):
+        r = self.table.rowAt(pos.y())
+        if r < 0:
+            return
+        self.table.selectRow(r)
+        it, idle = self.items()[r], not self.busy
+        m = QMenu(self)
+        a = m.addAction("Open page")
+        a.setEnabled(bool(it.get("url")))
+        a.triggered.connect(self.open_page)
+        if it["kind"] not in ADDON_KINDS:
+            a = m.addAction("Mark as seen")
+            a.setEnabled(idle and bool(it.get("latest")))
+            a.triggered.connect(self.mark_seen)
+        m.addSeparator()
+        a = m.addAction("Rename / edit...")
+        a.setEnabled(idle)
+        a.triggered.connect(self.edit_item)
+        a = m.addAction("Remove")
+        a.setEnabled(idle)
+        a.triggered.connect(self.remove_item)
+        m.exec(self.table.viewport().mapToGlobal(pos))
 
     def cur(self):
         rows = self.table.selectionModel().selectedRows()
@@ -408,14 +452,10 @@ class Main(QMainWindow):
         it = self.items()[r] if r is not None and r < len(self.items()) else None
         idle = not self.busy
         self.btn_check.setEnabled(idle)
-        self.btn_open.setEnabled(bool(it and it.get("url")))
-        self.btn_seen.setEnabled(idle and bool(it and it["kind"] not in ADDON_KINDS and it.get("latest")))
         self.btn_update.setEnabled(idle and bool(it and self.status(it)[2]))
         self.btn_update_all.setEnabled(idle and any(self.status(i)[2] for i in self.items()))
-        for b in (self.btn_add, self.btn_scan, self.btn_dir):
-            b.setEnabled(idle)
-        self.btn_edit.setEnabled(idle and it is not None)
-        self.btn_remove.setEnabled(idle and it is not None)
+        for b_ in (self.btn_add, self.btn_scan, self.btn_dir):
+            b_.setEnabled(idle)
 
     def set_busy(self, busy, msg=""):
         self.busy = busy
