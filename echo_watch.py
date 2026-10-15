@@ -51,7 +51,8 @@ QMenu::item:disabled { color: #4a5360; }
 QStatusBar { color: #6f7885; }
 """
 
-LOGO = Path(__file__).resolve().parent / "assets" / "logo.svg"
+_BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # bundled files when frozen
+LOGO = _BASE / "assets" / "logo.svg"
 
 
 def logo_pixmap(size, dpr=1.0):

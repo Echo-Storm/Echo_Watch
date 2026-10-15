@@ -20,7 +20,14 @@ A small PyQt6 desktop app: press **Check all** once a day and see what changed.
 Every item has a display name you can rename. First check of a release/commit item sets a silent
 baseline; use **Mark seen** to clear a "New" flag.
 
-## Run
+## Download
+
+Grab `EchoWatch.exe` from the [latest release](https://github.com/Echo-Storm/Echo_Watch/releases/latest)
+and run it - no Python needed. Settings and your watchlist are saved in a `data` folder next to the exe.
+(The exe is unsigned, so Windows SmartScreen or antivirus may warn on first run; the source here is
+what it was built from. To build it yourself: `toolsuild_exe.bat`.)
+
+## Run from source
 
 ```
 pip install -r requirements.txt

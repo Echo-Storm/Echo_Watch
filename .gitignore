@@ -5,3 +5,7 @@ dist/
 build/
 shot.png
 data/
+*.exe
+dist/
+build/
+*.spec

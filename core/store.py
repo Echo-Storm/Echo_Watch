@@ -6,9 +6,12 @@ older version in %LOCALAPPDATA%/EchoWatch is copied over once on first run.
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent.parent
+# Frozen (PyInstaller) builds unpack to a temp dir, so data must sit next to the .exe instead.
+APP_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+           else Path(__file__).resolve().parent.parent)
 DEFAULT_DATA_DIR = APP_DIR / "data"
 LEGACY_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EchoWatch"
 
