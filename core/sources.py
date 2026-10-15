@@ -112,14 +112,41 @@ def commits_since(repo, base_sha, head_sha):
         return None
 
 
+def _visible_text(markup):
+    markup = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", markup)
+    markup = re.sub(r"(?s)<!--.*?-->", " ", markup)
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
+
+
+def check_page(url, pattern="", **_):
+    """Watch a value on any web page. `pattern` is a regex run on the visible text;
+    the first group (or the whole match) is the value. Empty pattern = hash of the text."""
+    r = _get(url, headers=UA)
+    text = _visible_text(r.text)
+    if pattern:
+        try:
+            m = re.search(pattern, text, re.I)
+        except re.error as e:
+            raise CheckError(f"bad pattern: {e}") from e
+        if not m:
+            raise CheckError("pattern not found on the page")
+        value = (m.group(1) if m.groups() else m.group(0)).strip()
+    else:
+        import hashlib
+        value = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+    return {"latest": value, "url": url, "note": "", "download": None}
+
+
 CHECKERS = {"wago": check_wago, "release": check_release, "commits": check_commits,
-            "ghaddon": check_release}
+            "ghaddon": check_release, "page": check_page}
 
 
 def run_check(item):
     fn = CHECKERS[item["kind"]]
     args = {k: v for k, v in item.items() if k not in ("name", "kind")}
-    if item["kind"] in ("release", "commits", "ghaddon"):
+    if item["kind"] == "page":
+        args = {"url": item["url"], "pattern": item.get("pattern", "")}
+    elif item["kind"] in ("release", "commits", "ghaddon"):
         args = {"repo": item["repo"], "branch": item.get("branch", "")}
     return fn(**args)
 

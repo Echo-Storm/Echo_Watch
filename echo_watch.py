@@ -16,9 +16,9 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
 from core import sources, store
 
 KINDS = {"wago": "WoW addon (Wago)", "ghaddon": "WoW addon (GitHub)", "release": "GitHub releases",
-         "commits": "GitHub commits"}
+         "commits": "GitHub commits", "page": "Web page text"}
 ADDON_KINDS = ("wago", "ghaddon")  # installed locally, can auto-update
-KIND_ICON = {"wago": "\U0001F9E9", "ghaddon": "\U0001F9E9", "release": "\U0001F4E6", "commits": "\U0001F500"}
+KIND_ICON = {"wago": "\U0001F9E9", "ghaddon": "\U0001F9E9", "page": "\U0001F310", "release": "\U0001F4E6", "commits": "\U0001F500"}
 STATUS_ICON = {"Up to date": "✔", "Update available": "⬆", "Not installed": "⬇",
                "Version unknown": "⬆", "New": "●", "Check failed": "✖",
                "Not checked": "○"}
@@ -172,6 +172,14 @@ class AddDialog(QDialog):
             self.extra.setPlaceholderText("RXPGuides")
             self.hint.setText("Uses the repo's latest GitHub release (its .zip asset) and the installed "
                               "version from the folder's .toc.")
+        elif k == "page":
+            self.target_label.setText("Page URL")
+            self.target.setPlaceholderText("https://example.com/page")
+            self.extra_label.setText("Text to watch (regex)")
+            self.extra.setPlaceholderText(r"Upload time\s*([\d/]+ [\d:]+ [AP]M)")
+            self.hint.setText("Matched against the page's visible text; the first (group) or the whole "
+                              "match is the value, and any change is flagged. Leave empty to flag any "
+                              "change to the page text (noisy on pages with ads or clocks).")
         elif k == "wago":
             self.target_label.setText("Wago slug or ID")
             self.target.setPlaceholderText("auctionator")
@@ -191,8 +199,8 @@ class AddDialog(QDialog):
         self.kind.setCurrentIndex(self.kind.findData(it["kind"]))
         self.kind.setEnabled(False)
         self.name.setText(it["name"])
-        self.target.setText(it.get("slug") or it.get("repo", ""))
-        self.extra.setText(it.get("folder") or it.get("branch", ""))
+        self.target.setText(it.get("slug") or it.get("repo") or (it.get("url", "") if it["kind"] == "page" else ""))
+        self.extra.setText(it.get("folder") or it.get("branch") or it.get("pattern", ""))
 
     def _ok(self):
         k, t, x = self.kind.currentData(), self.target.text().strip(), self.extra.text().strip()
@@ -202,6 +210,13 @@ class AddDialog(QDialog):
                 return QMessageBox.warning(self, "Check input", "Enter the source and a plain folder name.")
             if k == "ghaddon" and not re.fullmatch(r"[\w.-]+/[\w.-]+", t):
                 return QMessageBox.warning(self, "Check input", "Repo must look like owner/name.")
+        elif k == "page":
+            if not re.match(r"https?://\S+$", t):
+                return QMessageBox.warning(self, "Check input", "Enter a full http(s):// URL.")
+            try:
+                re.compile(x)
+            except re.error as e:
+                return QMessageBox.warning(self, "Check input", f"The pattern isn't a valid regex: {e}")
         elif not re.fullmatch(r"[\w.-]+/[\w.-]+", t):
             return QMessageBox.warning(self, "Check input", "Repo must look like owner/name.")
         self.accept()
@@ -215,6 +230,8 @@ class AddDialog(QDialog):
         if k == "ghaddon":
             folder = x or n or t.split("/")[-1]
             return {"name": n or folder, "kind": k, "repo": t, "folder": folder}
+        if k == "page":
+            return {"name": n or t, "kind": k, "url": t, "pattern": x}
         it = {"name": n or t, "kind": k, "repo": t}
         if k == "commits" and x:
             it["branch"] = x
@@ -559,6 +576,9 @@ class Main(QMainWindow):
             if new["kind"] in ADDON_KINDS and i["kind"] in ADDON_KINDS:
                 if i["folder"].lower() == new["folder"].lower():
                     return True
+            elif new["kind"] == "page":
+                if i["kind"] == "page" and i["url"] == new["url"] and i.get("pattern", "") == new["pattern"]:
+                    return True
             elif i["kind"] == new["kind"] and i["repo"].lower() == new["repo"].lower() \
                     and i.get("branch", "") == new.get("branch", ""):
                 return True
@@ -583,7 +603,8 @@ class Main(QMainWindow):
         d.load(old)
         if d.exec():
             new = d.item()
-            same_target = all(new.get(k) == old.get(k) for k in ("slug", "repo", "branch", "folder"))
+            keys = ("slug", "repo", "branch", "folder") + (("url", "pattern") if new["kind"] == "page" else ())
+            same_target = all(new.get(k) == old.get(k) for k in keys)
             if same_target:  # rename only: keep tracked state
                 old["name"] = new["name"]
             elif self._duplicate(new, ignore=old):
