@@ -5,6 +5,7 @@ A small PyQt6 desktop app: press **Check all** once a day and see what changed.
 - **WoW addons** - compares the version in your AddOns folder (read from the `.toc`) with the latest
   [Wago](https://addons.wago.io) release for the *forever* flavor. **Update now** downloads the zip,
   moves the old folder to a backup, and installs the new one.
+- **WoW addons from GitHub** - same as above but the latest version and zip come from a repo's releases (e.g. `RestedXP/RXPGuides`), so addons that are not on Wago can still auto-update.
 - **GitHub releases** - flags a new tag since you last marked it seen.
 - **GitHub commits** - shows the newest commit and how many are new since you last marked it seen.
 

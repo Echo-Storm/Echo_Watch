@@ -112,13 +112,14 @@ def commits_since(repo, base_sha, head_sha):
         return None
 
 
-CHECKERS = {"wago": check_wago, "release": check_release, "commits": check_commits}
+CHECKERS = {"wago": check_wago, "release": check_release, "commits": check_commits,
+            "ghaddon": check_release}
 
 
 def run_check(item):
     fn = CHECKERS[item["kind"]]
     args = {k: v for k, v in item.items() if k not in ("name", "kind")}
-    if item["kind"] in ("release", "commits"):
+    if item["kind"] in ("release", "commits", "ghaddon"):
         args = {"repo": item["repo"], "branch": item.get("branch", "")}
     return fn(**args)
 

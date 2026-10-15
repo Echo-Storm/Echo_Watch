@@ -15,8 +15,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
 
 from core import sources, store
 
-KINDS = {"wago": "WoW addon (Wago)", "release": "GitHub releases", "commits": "GitHub commits"}
-KIND_ICON = {"wago": "\U0001F9E9", "release": "\U0001F4E6", "commits": "\U0001F500"}
+KINDS = {"wago": "WoW addon (Wago)", "ghaddon": "WoW addon (GitHub)", "release": "GitHub releases",
+         "commits": "GitHub commits"}
+ADDON_KINDS = ("wago", "ghaddon")  # installed locally, can auto-update
+KIND_ICON = {"wago": "\U0001F9E9", "ghaddon": "\U0001F9E9", "release": "\U0001F4E6", "commits": "\U0001F500"}
 STATUS_ICON = {"Up to date": "✔", "Update available": "⬆", "Not installed": "⬇",
                "Version unknown": "⬆", "New": "●", "Check failed": "✖",
                "Not checked": "○"}
@@ -50,7 +52,7 @@ def apply_result(it, res):
     it["note"], it["download"] = res.get("note", ""), res.get("download")
     it["latest_full"] = res.get("full_sha")
     it["ahead"] = res.get("ahead")
-    if it["kind"] != "wago" and it.get("seen") is None:  # silent baseline on first sight
+    if it["kind"] not in ADDON_KINDS and it.get("seen") is None:  # silent baseline on first sight
         it["seen"], it["seen_full"] = res["latest"], res.get("full_sha")
 
 
@@ -87,7 +89,7 @@ class InstallJob(QRunnable):
     def run(self):
         for ref in self.refs:
             try:
-                fresh = sources.check_wago(ref["slug"], ref.get("flavor", "forever"))  # links expire
+                fresh = sources.run_check(ref)  # re-fetch: Wago download links expire
                 if not fresh.get("download"):
                     raise sources.CheckError("no download link")
                 tops = sources.install_zip(fresh["download"], self.addons_dir, store.BACKUPS)
@@ -153,7 +155,15 @@ class AddDialog(QDialog):
         self._sync()
 
     def _sync(self):
-        if self.kind.currentData() == "wago":
+        k = self.kind.currentData()
+        if k == "ghaddon":
+            self.target_label.setText("Repo")
+            self.target.setPlaceholderText("RestedXP/RXPGuides")
+            self.extra_label.setText("AddOns folder")
+            self.extra.setPlaceholderText("RXPGuides")
+            self.hint.setText("Uses the repo's latest GitHub release (its .zip asset) and the installed "
+                              "version from the folder's .toc.")
+        elif k == "wago":
             self.target_label.setText("Wago slug or ID")
             self.target.setPlaceholderText("auctionator")
             self.extra_label.setText("AddOns folder")
@@ -177,10 +187,12 @@ class AddDialog(QDialog):
 
     def _ok(self):
         k, t, x = self.kind.currentData(), self.target.text().strip(), self.extra.text().strip()
-        if k == "wago":
-            folder = x or self.name.text().strip() or t
+        if k in ADDON_KINDS:
+            folder = x or self.name.text().strip() or t.split("/")[-1]
             if not t or not sources.safe_folder(folder):
-                return QMessageBox.warning(self, "Check input", "Enter a Wago slug and a plain folder name.")
+                return QMessageBox.warning(self, "Check input", "Enter the source and a plain folder name.")
+            if k == "ghaddon" and not re.fullmatch(r"[\w.-]+/[\w.-]+", t):
+                return QMessageBox.warning(self, "Check input", "Repo must look like owner/name.")
         elif not re.fullmatch(r"[\w.-]+/[\w.-]+", t):
             return QMessageBox.warning(self, "Check input", "Repo must look like owner/name.")
         self.accept()
@@ -191,6 +203,9 @@ class AddDialog(QDialog):
         if k == "wago":
             folder = x or n or t
             return {"name": n or folder, "kind": k, "slug": t, "flavor": "forever", "folder": folder}
+        if k == "ghaddon":
+            folder = x or n or t.split("/")[-1]
+            return {"name": n or folder, "kind": k, "repo": t, "folder": folder}
         it = {"name": n or t, "kind": k, "repo": t}
         if k == "commits" and x:
             it["branch"] = x
@@ -331,7 +346,7 @@ class Main(QMainWindow):
         return next((i for i, x in enumerate(self.items()) if x is ref), None)
 
     def have(self, it):
-        if it["kind"] == "wago":
+        if it["kind"] in ADDON_KINDS:
             return sources.installed_version(self.cfg["addons_dir"], it["folder"])
         return it.get("seen")
 
@@ -342,7 +357,7 @@ class Main(QMainWindow):
         latest = it.get("latest")
         if not latest:
             return "Not checked", MUTED, False
-        if it["kind"] == "wago":
+        if it["kind"] in ADDON_KINDS:
             have, can = self.have(it), bool(it.get("download"))
             if have is None:
                 return "Not installed", WARN, can
@@ -394,7 +409,7 @@ class Main(QMainWindow):
         idle = not self.busy
         self.btn_check.setEnabled(idle)
         self.btn_open.setEnabled(bool(it and it.get("url")))
-        self.btn_seen.setEnabled(idle and bool(it and it["kind"] != "wago" and it.get("latest")))
+        self.btn_seen.setEnabled(idle and bool(it and it["kind"] not in ADDON_KINDS and it.get("latest")))
         self.btn_update.setEnabled(idle and bool(it and self.status(it)[2]))
         self.btn_update_all.setEnabled(idle and any(self.status(i)[2] for i in self.items()))
         for b in (self.btn_add, self.btn_scan, self.btn_dir):
@@ -473,7 +488,7 @@ class Main(QMainWindow):
             self._run_install([self.items()[r]])
 
     def update_all(self):
-        refs = [i for i in self.items() if i["kind"] == "wago" and self.status(i)[2]
+        refs = [i for i in self.items() if i["kind"] in ADDON_KINDS and self.status(i)[2]
                 and self.status(i)[0] != "Not installed"]
         if refs and self._confirm_install(refs):
             self._run_install(refs)
@@ -499,11 +514,12 @@ class Main(QMainWindow):
     # -- list management ---------------------------------------------------
     def _duplicate(self, new, ignore=None):
         for i in self.items():
-            if i is ignore or i["kind"] != new["kind"]:
+            if i is ignore:
                 continue
-            if new["kind"] == "wago" and i["folder"].lower() == new["folder"].lower():
-                return True
-            if new["kind"] != "wago" and i["repo"].lower() == new["repo"].lower() \
+            if new["kind"] in ADDON_KINDS and i["kind"] in ADDON_KINDS:
+                if i["folder"].lower() == new["folder"].lower():
+                    return True
+            elif i["kind"] == new["kind"] and i["repo"].lower() == new["repo"].lower() \
                     and i.get("branch", "") == new.get("branch", ""):
                 return True
         return False
@@ -562,7 +578,7 @@ class Main(QMainWindow):
             QMessageBox.information(self, "AddOns folder", "The saved AddOns folder doesn't exist. "
                                     "Set the right one in Settings first.")
             return self.open_settings()
-        known = [i["folder"] for i in self.items() if i["kind"] == "wago"]
+        known = [i["folder"] for i in self.items() if i["kind"] in ADDON_KINDS]
         slugs = [i["slug"] for i in self.items() if i["kind"] == "wago"]
         job = ScanJob(self.cfg["addons_dir"], known, slugs)
         job.signals.scanned.connect(self.on_scanned)
