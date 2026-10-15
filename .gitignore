@@ -4,3 +4,4 @@ venv/
 dist/
 build/
 shot.png
+data/
