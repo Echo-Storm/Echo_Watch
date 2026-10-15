@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -26,19 +27,21 @@ class CheckError(Exception):
 
 
 _gh_token = None
+_token_lock = threading.Lock()
 
 
 def _github_headers():
     global _gh_token
-    if _gh_token is None:
-        _gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
-        if not _gh_token:
-            try:
-                out = subprocess.run(["gh", "auth", "token"], capture_output=True,
-                                     text=True, timeout=5, creationflags=0x08000000)
-                _gh_token = out.stdout.strip() if out.returncode == 0 else ""
-            except (OSError, subprocess.SubprocessError):
-                _gh_token = ""
+    with _token_lock:  # worker threads race here on the first check
+        if _gh_token is None:
+            _gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+            if not _gh_token:
+                try:
+                    out = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                                         text=True, timeout=5, creationflags=0x08000000)
+                    _gh_token = out.stdout.strip() if out.returncode == 0 else ""
+                except (OSError, subprocess.SubprocessError):
+                    _gh_token = ""
     h = dict(UA, Accept="application/vnd.github+json")
     if _gh_token:
         h["Authorization"] = f"Bearer {_gh_token}"
@@ -52,7 +55,7 @@ def _get(url, **kw):
         raise CheckError(f"network: {e.__class__.__name__}") from e
     if r.status_code == 404:
         raise CheckError("not found (404) - private or wrong name?")
-    if r.status_code == 403 and "rate limit" in r.text.lower():
+    if r.status_code in (403, 429) and "rate limit" in r.text.lower():
         raise CheckError("GitHub rate limit hit")
     if r.status_code >= 400:
         raise CheckError(f"HTTP {r.status_code}")
@@ -74,7 +77,7 @@ def check_wago(slug, flavor="forever", **_):
     if not rel:
         raise CheckError(f"no '{flavor}' release")
     note = (rel.get("changelog") or "").strip().splitlines()
-    note = next((ln.lstrip("- ").strip() for ln in note[::-1] if ln.strip().startswith("-")), "")
+    note = next((ln.strip().lstrip("-* ").strip() for ln in note if ln.strip().startswith(("-", "*"))), "")
     return {"latest": str(rel["label"]), "url": page, "note": note,
             "download": rel.get("download_link")}
 
@@ -122,41 +125,91 @@ def run_check(item):
 
 # --- addon installed version / installing --------------------------------
 
+def safe_folder(name):
+    """A bare folder name: no separators, no traversal."""
+    return bool(name) and name not in (".", "..") and not any(c in name for c in "\\/:")
+
+
+def _read_toc(path):
+    meta = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"##\s*([\w-]+)\s*:\s*(.*)", line)
+        if m and m.group(1) not in meta:
+            meta[m.group(1)] = m.group(2).strip()
+    return meta
+
+
 def installed_version(addons_dir, folder):
+    """Version string from the .toc, None if the addon isn't installed."""
+    if not safe_folder(folder):
+        return None
     toc = Path(addons_dir) / folder / f"{folder}.toc"
     if not toc.exists():
         return None
-    for line in toc.read_text(encoding="utf-8", errors="replace").splitlines():
-        m = re.match(r"##\s*Version:\s*(.+)", line)
-        if m:
-            return m.group(1).strip()
-    return "?"
+    return _read_toc(toc).get("Version") or "?"
+
+
+def norm_version(v):
+    return re.sub(r"^[vV]\s*", "", (v or "").strip())
+
+
+def version_unknown(v):
+    return v in (None, "", "?") or "@" in v  # "@project-version@" = unpackaged dev copy
+
+
+def scan_addons(addons_dir):
+    """Top-level addon folders with a matching .toc -> [{folder, title, version, wago_id}]."""
+    out = []
+    base = Path(addons_dir)
+    if not base.is_dir():
+        return out
+    for d in sorted(base.iterdir(), key=lambda x: x.name.lower()):
+        toc = d / f"{d.name}.toc"
+        if d.is_dir() and not d.name.startswith("Blizzard_") and toc.exists():
+            meta = _read_toc(toc)
+            out.append({"folder": d.name, "version": meta.get("Version", "?"),
+                        "wago_id": meta.get("X-Wago-ID", "")})
+    return out
 
 
 def install_zip(url, addons_dir, backups_dir):
     """Download an addon zip and install its top-level folders into addons_dir.
-    Existing folders are moved to backups_dir first. Returns installed folder names."""
+    Existing folders are moved to backups_dir first; on any failure the new files
+    are removed and the backups restored. Returns installed folder names."""
     r = _get(url, headers=UA)
-    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+    except zipfile.BadZipFile as e:
+        raise CheckError("download was not a zip file") from e
     names = zf.namelist()
     tops = sorted({n.split("/")[0] for n in names if "/" in n})
-    if not tops or any(t in ("", "..") or ":" in t for t in tops):
+    if not tops or not all(safe_folder(t) for t in tops):
         raise CheckError("unexpected zip layout")
     addons = Path(addons_dir).resolve()
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for t in tops:
-        dest = addons / t
-        if dest.exists():
-            bk = Path(backups_dir) / stamp
-            bk.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dest), str(bk / t))
-    for n in names:
+    for n in names:  # validate everything before touching the disk
         target = (addons / n).resolve()
         if addons not in target.parents and target != addons:
             raise CheckError("zip tried to escape the AddOns folder")
-        if n.endswith("/"):
-            target.mkdir(parents=True, exist_ok=True)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(n))
+    bk = Path(backups_dir) / time.strftime("%Y%m%d-%H%M%S")
+    moved = []
+    try:
+        for t in tops:
+            dest = addons / t
+            if dest.exists():
+                bk.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dest), str(bk / t))
+                moved.append(t)
+        for n in names:
+            target = addons / n
+            if n.endswith("/"):
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(n))
+    except Exception:
+        for t in tops:
+            shutil.rmtree(addons / t, ignore_errors=True)
+        for t in moved:
+            shutil.move(str(bk / t), str(addons / t))
+        raise
     return tops

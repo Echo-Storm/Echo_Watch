@@ -1,11 +1,12 @@
 """Echo Watch - one-click daily update check for WoW addons and GitHub projects."""
+import re
 import sys
 import time
 import webbrowser
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                              QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
                              QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -14,9 +15,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog
 from core import sources, store
 
 KINDS = {"wago": "WoW addon (Wago)", "release": "GitHub releases", "commits": "GitHub commits"}
-KIND_ICON = {"wago": "🧩", "release": "📦", "commits": "🔀"}
+KIND_ICON = {"wago": "\U0001F9E9", "release": "\U0001F4E6", "commits": "\U0001F500"}
 STATUS_ICON = {"Up to date": "✔", "Update available": "⬆", "Not installed": "⬇",
-               "New": "●", "Check failed": "✖", "Not checked": "○"}
+               "Version unknown": "⬆", "New": "●", "Check failed": "✖",
+               "Not checked": "○"}
 
 STYLE = """
 * { font-family: 'Segoe UI'; font-size: 13px; color: #d8dee9; }
@@ -33,46 +35,92 @@ QPushButton#primary { background: #2fb5a8; color: #0b1114; border: none; font-we
 QPushButton#primary:hover { background: #3fcabc; }
 QPushButton#primary:disabled { background: #25544f; color: #0b1114; }
 QLineEdit, QComboBox { background: #1a1e25; border: 1px solid #2f3846; border-radius: 6px; padding: 6px; }
+QStatusBar { color: #7f8896; }
 """
 
 GOOD, WARN, BAD, MUTED = QColor("#5fd39a"), QColor("#f0b44c"), QColor("#ef6b6b"), QColor("#7f8896")
 COLS = ["Name", "Type", "Current", "New", "Status", "What changed"]
 
 
+def apply_result(it, res):
+    """Copy a successful check result onto a watchlist item."""
+    it.pop("error", None)
+    it["latest"], it["url"] = res["latest"], res["url"]
+    it["note"], it["download"] = res.get("note", ""), res.get("download")
+    it["latest_full"] = res.get("full_sha")
+    it["ahead"] = res.get("ahead")
+    if it["kind"] != "wago" and it.get("seen") is None:  # silent baseline on first sight
+        it["seen"], it["seen_full"] = res["latest"], res.get("full_sha")
+
+
 class Signals(QObject):
-    done = pyqtSignal(int, object, str)  # row, result dict | None, error
+    done = pyqtSignal(object, object, str)  # watchlist item (identity), result | None, error
+    scanned = pyqtSignal(list, int)         # new items, folders that matched nothing
 
 
 class CheckJob(QRunnable):
-    def __init__(self, row, item):
+    def __init__(self, ref):
         super().__init__()
-        self.row, self.item, self.signals = row, dict(item), Signals()
+        self.ref, self.signals = ref, Signals()
 
     def run(self):
+        item = dict(self.ref)
         try:
-            res = sources.run_check(self.item)
-            if self.item["kind"] == "commits" and self.item.get("seen_full"):
-                res["ahead"] = sources.commits_since(
-                    self.item["repo"], self.item["seen_full"], res["full_sha"])
-            self.signals.done.emit(self.row, res, "")
+            res = sources.run_check(item)
+            if item["kind"] == "commits" and item.get("seen_full") and res.get("full_sha") != item["seen_full"]:
+                res["ahead"] = sources.commits_since(item["repo"], item["seen_full"], res["full_sha"])
+            self.signals.done.emit(self.ref, res, "")
         except sources.CheckError as e:
-            self.signals.done.emit(self.row, None, str(e))
+            self.signals.done.emit(self.ref, None, str(e))
         except Exception as e:  # keep the pool alive on surprises
-            self.signals.done.emit(self.row, None, f"{e.__class__.__name__}: {e}")
+            self.signals.done.emit(self.ref, None, f"{e.__class__.__name__}: {e}")
 
 
 class InstallJob(QRunnable):
-    def __init__(self, row, url, addons_dir):
+    """Installs addons one after another (they may share folders)."""
+
+    def __init__(self, refs, addons_dir):
         super().__init__()
-        self.row, self.url, self.addons_dir = row, url, addons_dir
+        self.refs, self.addons_dir, self.signals = refs, addons_dir, Signals()
+
+    def run(self):
+        for ref in self.refs:
+            try:
+                fresh = sources.check_wago(ref["slug"], ref.get("flavor", "forever"))  # links expire
+                if not fresh.get("download"):
+                    raise sources.CheckError("no download link")
+                tops = sources.install_zip(fresh["download"], self.addons_dir, store.BACKUPS)
+                self.signals.done.emit(ref, dict(fresh, installed=tops), "")
+            except Exception as e:
+                self.signals.done.emit(ref, None, str(e) or e.__class__.__name__)
+
+
+class ScanJob(QRunnable):
+    """Find installed addons that Wago knows about and build watchlist items."""
+
+    def __init__(self, addons_dir, known_folders, known_slugs):
+        super().__init__()
+        self.addons_dir, self.known_folders, self.known_slugs = addons_dir, set(known_folders), set(known_slugs)
         self.signals = Signals()
 
     def run(self):
-        try:
-            tops = sources.install_zip(self.url, self.addons_dir, store.BACKUPS)
-            self.signals.done.emit(self.row, {"installed": tops}, "")
-        except Exception as e:
-            self.signals.done.emit(self.row, None, str(e))
+        found, misses, seen_slugs = [], 0, set(self.known_slugs)
+        for a in sources.scan_addons(self.addons_dir):
+            if a["folder"] in self.known_folders:
+                continue
+            slug = a["wago_id"] or a["folder"].lower()
+            if slug in seen_slugs:  # sub-module of a package we already track
+                continue
+            try:
+                res = sources.check_wago(slug)
+            except Exception:
+                misses += 1
+                continue
+            seen_slugs.add(slug)
+            it = {"name": a["folder"], "kind": "wago", "slug": slug, "flavor": "forever", "folder": a["folder"]}
+            apply_result(it, res)
+            found.append(it)
+        self.signals.scanned.emit(found, misses)
 
 
 class AddDialog(QDialog):
@@ -94,7 +142,7 @@ class AddDialog(QDialog):
         form.addRow(self.target_label, self.target)
         form.addRow(self.extra_label, self.extra)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
+        bb.accepted.connect(self._ok)
         bb.rejected.connect(self.reject)
         lay = QVBoxLayout(self)
         lay.addLayout(form)
@@ -105,11 +153,11 @@ class AddDialog(QDialog):
 
     def _sync(self):
         if self.kind.currentData() == "wago":
-            self.target_label.setText("Wago slug")
+            self.target_label.setText("Wago slug or ID")
             self.target.setPlaceholderText("auctionator")
             self.extra_label.setText("AddOns folder")
             self.extra.setPlaceholderText("Auctionator")
-            self.hint.setText("Slug is the end of addons.wago.io/addons/<slug>. The installed version "
+            self.hint.setText("The slug is the end of addons.wago.io/addons/<slug>. The installed version "
                               "is read from the folder's .toc. Release flavor: forever.")
         else:
             self.target_label.setText("Repo")
@@ -119,20 +167,29 @@ class AddDialog(QDialog):
             self.hint.setText("Baselined on first check, then flagged when something new appears.")
 
     def load(self, it):
-        self.setWindowTitle("Edit item")
+        self.setWindowTitle("Rename / edit")
         self.kind.setCurrentIndex(self.kind.findData(it["kind"]))
         self.kind.setEnabled(False)
         self.name.setText(it["name"])
         self.target.setText(it.get("slug") or it.get("repo", ""))
         self.extra.setText(it.get("folder") or it.get("branch", ""))
 
+    def _ok(self):
+        k, t, x = self.kind.currentData(), self.target.text().strip(), self.extra.text().strip()
+        if k == "wago":
+            folder = x or self.name.text().strip() or t
+            if not t or not sources.safe_folder(folder):
+                return QMessageBox.warning(self, "Check input", "Enter a Wago slug and a plain folder name.")
+        elif not re.fullmatch(r"[\w.-]+/[\w.-]+", t):
+            return QMessageBox.warning(self, "Check input", "Repo must look like owner/name.")
+        self.accept()
+
     def item(self):
         k = self.kind.currentData()
         t, x, n = self.target.text().strip(), self.extra.text().strip(), self.name.text().strip()
-        if not t:
-            return None
         if k == "wago":
-            return {"name": n or t, "kind": k, "slug": t, "flavor": "forever", "folder": x or n or t}
+            folder = x or n or t
+            return {"name": n or folder, "kind": k, "slug": t, "flavor": "forever", "folder": folder}
         it = {"name": n or t, "kind": k, "repo": t}
         if k == "commits" and x:
             it["branch"] = x
@@ -143,15 +200,19 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Echo Watch")
-        self.resize(1000, 540)
+        self.resize(1040, 560)
         self.cfg = store.load()
         self.pool = QThreadPool.globalInstance()
         self.pending = 0
+        self.busy = False
 
         title = QLabel("Echo Watch")
         title.setObjectName("title")
         self.sub = QLabel("")
         self.sub.setObjectName("sub")
+        self.chk_launch = QCheckBox("Check on launch")
+        self.chk_launch.setChecked(bool(self.cfg.get("check_on_launch")))
+        self.chk_launch.toggled.connect(self.set_launch)
         self.btn_check = QPushButton("Check all")
         self.btn_check.setObjectName("primary")
         self.btn_check.clicked.connect(self.check_all)
@@ -161,6 +222,8 @@ class Main(QMainWindow):
         tcol.addWidget(self.sub)
         head.addLayout(tcol)
         head.addStretch()
+        head.addWidget(self.chk_launch)
+        head.addSpacing(12)
         head.addWidget(self.btn_check)
 
         self.table = QTableWidget(0, len(COLS))
@@ -168,6 +231,7 @@ class Main(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         hh = self.table.horizontalHeader()
@@ -178,23 +242,24 @@ class Main(QMainWindow):
 
         self.btn_open = QPushButton("Open page")
         self.btn_update = QPushButton("Update now")
+        self.btn_update_all = QPushButton("Update all")
         self.btn_seen = QPushButton("Mark seen")
         self.btn_add = QPushButton("Add...")
+        self.btn_scan = QPushButton("Scan AddOns")
         self.btn_edit = QPushButton("Rename / edit...")
-        self.btn_edit.clicked.connect(self.edit_item)
         self.btn_remove = QPushButton("Remove")
         self.btn_dir = QPushButton("AddOns folder...")
-        self.btn_open.clicked.connect(self.open_page)
-        self.btn_update.clicked.connect(self.update_now)
-        self.btn_seen.clicked.connect(self.mark_seen)
-        self.btn_add.clicked.connect(self.add_item)
-        self.btn_remove.clicked.connect(self.remove_item)
-        self.btn_dir.clicked.connect(self.pick_dir)
+        for b, fn in ((self.btn_open, self.open_page), (self.btn_update, self.update_now),
+                      (self.btn_update_all, self.update_all), (self.btn_seen, self.mark_seen),
+                      (self.btn_add, self.add_item), (self.btn_scan, self.scan_addons),
+                      (self.btn_edit, self.edit_item), (self.btn_remove, self.remove_item),
+                      (self.btn_dir, self.pick_dir)):
+            b.clicked.connect(fn)
         bar = QHBoxLayout()
-        for b in (self.btn_open, self.btn_update, self.btn_seen):
+        for b in (self.btn_open, self.btn_update, self.btn_update_all, self.btn_seen):
             bar.addWidget(b)
         bar.addStretch()
-        for b in (self.btn_add, self.btn_edit, self.btn_remove, self.btn_dir):
+        for b in (self.btn_add, self.btn_scan, self.btn_edit, self.btn_remove, self.btn_dir):
             bar.addWidget(b)
 
         root = QWidget()
@@ -216,6 +281,13 @@ class Main(QMainWindow):
     def save(self):
         store.save(self.cfg)
 
+    def set_launch(self, on):
+        self.cfg["check_on_launch"] = on
+        self.save()
+
+    def row_of(self, ref):
+        return next((i for i, x in enumerate(self.items()) if x is ref), None)
+
     def have(self, it):
         if it["kind"] == "wago":
             return sources.installed_version(self.cfg["addons_dir"], it["folder"])
@@ -229,11 +301,12 @@ class Main(QMainWindow):
         if not latest:
             return "Not checked", MUTED, False
         if it["kind"] == "wago":
-            have = self.have(it)
-            can = bool(it.get("download"))
+            have, can = self.have(it), bool(it.get("download"))
             if have is None:
                 return "Not installed", WARN, can
-            if have == latest:
+            if sources.version_unknown(have):
+                return "Version unknown", WARN, can
+            if sources.norm_version(have) == sources.norm_version(latest):
                 return "Up to date", GOOD, False
             return "Update available", WARN, can
         if it.get("seen") == latest:
@@ -254,7 +327,7 @@ class Main(QMainWindow):
         it = self.items()[r]
         text, color, _ = self.status(it)
         detail = it.get("error") or it.get("note") or ""
-        icon = STATUS_ICON.get(text, "●" if "commit" in text else "")
+        icon = STATUS_ICON.get(text, "●")
         newer = text not in ("Up to date", "Not checked", "Check failed")
         vals = [it["name"], f"{KIND_ICON[it['kind']]}  {KINDS[it['kind']]}", self.have(it) or "-",
                 (it.get("latest") or "-") if newer else "-", f"{icon}  {text}", detail]
@@ -275,49 +348,54 @@ class Main(QMainWindow):
 
     def _buttons(self):
         r = self.cur()
-        it = self.items()[r] if r is not None else None
+        it = self.items()[r] if r is not None and r < len(self.items()) else None
+        idle = not self.busy
+        self.btn_check.setEnabled(idle)
         self.btn_open.setEnabled(bool(it and it.get("url")))
-        self.btn_seen.setEnabled(bool(it and it["kind"] != "wago" and it.get("latest")))
-        self.btn_update.setEnabled(bool(it and self.status(it)[2]))
-        self.btn_remove.setEnabled(it is not None)
-        self.btn_edit.setEnabled(it is not None)
+        self.btn_seen.setEnabled(idle and bool(it and it["kind"] != "wago" and it.get("latest")))
+        self.btn_update.setEnabled(idle and bool(it and self.status(it)[2]))
+        self.btn_update_all.setEnabled(idle and any(self.status(i)[2] for i in self.items()))
+        for b in (self.btn_add, self.btn_scan, self.btn_dir):
+            b.setEnabled(idle)
+        self.btn_edit.setEnabled(idle and it is not None)
+        self.btn_remove.setEnabled(idle and it is not None)
 
-    # -- actions -----------------------------------------------------------
+    def set_busy(self, busy, msg=""):
+        self.busy = busy
+        self.btn_check.setText("Working..." if busy else "Check all")
+        if msg:
+            self.statusBar().showMessage(msg)
+        self._buttons()
+
+    # -- checking ----------------------------------------------------------
     def check_all(self):
-        if self.pending or not self.items():
+        if self.busy or not self.items():
             return
-        self.btn_check.setEnabled(False)
-        self.btn_check.setText("Checking...")
-        for r, it in enumerate(self.items()):
+        self.set_busy(True, "Checking...")
+        for it in list(self.items()):
             self.pending += 1
-            job = CheckJob(r, it)
+            job = CheckJob(it)
             job.signals.done.connect(self.on_checked)
             self.pool.start(job)
 
-    def on_checked(self, row, res, err):
-        it = self.items()[row]
-        if res is None:
-            it["error"] = err
-        else:
-            it.pop("error", None)
-            it["latest"], it["url"] = res["latest"], res["url"]
-            it["note"], it["download"] = res.get("note", ""), res.get("download")
-            it["latest_full"] = res.get("full_sha")
-            it["ahead"] = res.get("ahead")
-            if it["kind"] != "wago" and it.get("seen") is None:  # baseline silently
-                it["seen"], it["seen_full"] = res["latest"], res.get("full_sha")
-        self.render_row(row)
+    def on_checked(self, ref, res, err):
+        row = self.row_of(ref)
+        if row is not None:
+            if res is None:
+                ref["error"] = err
+            else:
+                apply_result(ref, res)
+            self.render_row(row)
         self.pending -= 1
         if self.pending == 0:
             self.cfg["last_check"] = time.time()
             self.save()
-            self.btn_check.setEnabled(True)
-            self.btn_check.setText("Check all")
             self.reload_table()
-            self._buttons()
-            n = sum(1 for i in self.items() if self.status(i)[1] == WARN)
-            self.statusBar().showMessage(f"{n} item(s) need attention" if n else "Everything is current", 6000)
+            self.set_busy(False)
+            n = sum(1 for i in self.items() if self.status(i)[1] in (WARN, BAD))
+            self.statusBar().showMessage(f"{n} item(s) need attention" if n else "Everything is current", 8000)
 
+    # -- row actions -------------------------------------------------------
     def open_page(self):
         r = self.cur()
         if r is not None and self.items()[r].get("url"):
@@ -333,55 +411,85 @@ class Main(QMainWindow):
         self.render_row(r)
         self._buttons()
 
-    def update_now(self):
-        r = self.cur()
-        if r is None:
-            return
-        it = self.items()[r]
+    def _confirm_install(self, refs):
+        names = "\n".join(f"  {i['name']}  {i.get('latest', '')}" for i in refs)
         ask = QMessageBox.question(
-            self, "Update", f"Install {it['name']} {it['latest']} into\n{self.cfg['addons_dir']}?\n\n"
-            "The current folder is moved to a backup first.")
-        if ask != QMessageBox.StandardButton.Yes:
-            return
-        job = InstallJob(r, it["download"], self.cfg["addons_dir"])
+            self, "Update", f"Install into\n{self.cfg['addons_dir']}\n\n{names}\n\n"
+            "Current folders are moved to a backup first.")
+        return ask == QMessageBox.StandardButton.Yes
+
+    def _run_install(self, refs):
+        job = InstallJob(refs, self.cfg["addons_dir"])
         job.signals.done.connect(self.on_installed)
-        self.btn_update.setEnabled(False)
-        self.statusBar().showMessage(f"Installing {it['name']}...")
+        self.pending = len(refs)
+        self.set_busy(True, "Installing...")
         self.pool.start(job)
 
-    def on_installed(self, row, res, err):
+    def update_now(self):
+        r = self.cur()
+        if r is not None and self._confirm_install([self.items()[r]]):
+            self._run_install([self.items()[r]])
+
+    def update_all(self):
+        refs = [i for i in self.items() if i["kind"] == "wago" and self.status(i)[2]
+                and self.status(i)[0] != "Not installed"]
+        if refs and self._confirm_install(refs):
+            self._run_install(refs)
+
+    def on_installed(self, ref, res, err):
+        row = self.row_of(ref)
         if res is None:
-            QMessageBox.warning(self, "Update failed", err)
-            self.statusBar().clearMessage()
+            ref["error"] = f"update failed: {err}"
         else:
+            apply_result(ref, res)
+        if row is not None:
+            self.render_row(row)
+        self.pending -= 1
+        if self.pending == 0:
+            self.save()
+            self.set_busy(False)
+            failed = [i["name"] for i in self.items() if str(i.get("error", "")).startswith("update failed")]
             self.statusBar().showMessage(
-                "Installed: " + ", ".join(res["installed"]) + f"  (backups in {store.BACKUPS})", 10000)
-        self.render_row(row)
-        self._buttons()
+                ("Some updates failed: " + ", ".join(failed)) if failed
+                else f"Update complete  (backups in {store.BACKUPS})", 12000)
+            self.reload_table()
+
+    # -- list management ---------------------------------------------------
+    def _duplicate(self, new, ignore=None):
+        for i in self.items():
+            if i is ignore or i["kind"] != new["kind"]:
+                continue
+            if new["kind"] == "wago" and i["folder"].lower() == new["folder"].lower():
+                return True
+            if new["kind"] != "wago" and i["repo"].lower() == new["repo"].lower() \
+                    and i.get("branch", "") == new.get("branch", ""):
+                return True
+        return False
 
     def add_item(self):
         d = AddDialog(self)
         if d.exec():
             it = d.item()
-            if it:
-                self.items().append(it)
-                self.save()
-                self.reload_table()
+            if self._duplicate(it):
+                return QMessageBox.information(self, "Already watching", "That item is already on the list.")
+            self.items().append(it)
+            self.save()
+            self.reload_table()
 
     def edit_item(self):
         r = self.cur()
-        if r is None:
+        if r is None or self.busy:
             return
         old = self.items()[r]
         d = AddDialog(self)
         d.load(old)
         if d.exec():
             new = d.item()
-            if not new:
-                return
             same_target = all(new.get(k) == old.get(k) for k in ("slug", "repo", "branch", "folder"))
-            if same_target:  # rename only: keep all tracked state
+            if same_target:  # rename only: keep tracked state
                 old["name"] = new["name"]
+            elif self._duplicate(new, ignore=old):
+                return QMessageBox.information(self, "Already watching", "That item is already on the list.")
             else:
                 self.items()[r] = new
             self.save()
@@ -406,13 +514,37 @@ class Main(QMainWindow):
             self.save()
             self.reload_table()
 
+    def scan_addons(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Pick the AddOns folder to scan (retail, classic, or beta)", self.cfg["addons_dir"])
+        if not d:
+            return
+        if d != self.cfg["addons_dir"]:
+            self.cfg["addons_dir"] = d
+            self.save()
+            self.reload_table()
+        known = [i["folder"] for i in self.items() if i["kind"] == "wago"]
+        slugs = [i["slug"] for i in self.items() if i["kind"] == "wago"]
+        job = ScanJob(self.cfg["addons_dir"], known, slugs)
+        job.signals.scanned.connect(self.on_scanned)
+        self.set_busy(True, "Scanning AddOns folder and asking Wago...")
+        self.pool.start(job)
+
+    def on_scanned(self, found, misses):
+        self.items().extend(found)
+        self.save()
+        self.reload_table()
+        self.set_busy(False)
+        msg = f"Added {len(found)} addon(s) found on Wago"
+        self.statusBar().showMessage(msg + (f"; {misses} folder(s) not on Wago were skipped." if misses else "."), 12000)
+
 
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     w = Main()
     w.show()
-    if "--check" in sys.argv:
+    if "--check" in sys.argv or w.cfg.get("check_on_launch"):
         w.check_all()
     sys.exit(app.exec())
 
