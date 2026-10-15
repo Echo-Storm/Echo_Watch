@@ -1,5 +1,7 @@
 # Echo Watch
 
+![Echo Watch](docs/screenshot.png)
+
 A small PyQt6 desktop app: press **Check all** once a day and see what changed.
 
 - **WoW addons** - compares the version in your AddOns folder (read from the `.toc`) with the latest

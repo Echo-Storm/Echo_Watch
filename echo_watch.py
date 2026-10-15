@@ -5,8 +5,9 @@ import time
 import webbrowser
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtCore import QObject, QRectF, QRunnable, Qt, QThreadPool, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                              QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -26,21 +27,21 @@ STATUS_ICON = {"Up to date": "✔", "Update available": "⬆", "Not installed": 
 STYLE = """
 * { font-family: 'Segoe UI'; font-size: 13px; color: #d8dee9; }
 QMainWindow, QDialog { background: #14171c; }
-QLabel#title { font-size: 22px; font-weight: 600; color: #ffffff; }
+QLabel#title { font-family: 'Georgia'; font-size: 24px; font-weight: 600; color: #f1ead8; }
 QLabel#sub { color: #6f7885; }
 QTableWidget { background: transparent; border: none; outline: 0; }
 QTableWidget::item { padding: 0 18px; border: none; border-bottom: 1px solid #1d222a; }
-QTableWidget::item:selected { background: #1c2632; }
+QTableWidget::item:selected { background: #222633; }
 QHeaderView::section { background: transparent; color: #5d6674; border: none;
-                       border-bottom: 1px solid #262c36; padding: 10px 18px; font-size: 11px; }
+                       border-bottom: 1px solid #3a3220; padding: 10px 18px; font-size: 11px; }
 QPushButton { background: transparent; border: 1px solid #2a3240; border-radius: 6px; padding: 7px 16px; }
 QPushButton:hover { background: #222a35; }
 QPushButton:disabled { color: #4a5360; border-color: #212731; }
-QPushButton#primary { background: #2fb5a8; color: #0b1114; border: none; font-weight: 600; padding: 9px 24px; }
-QPushButton#primary:hover { background: #3fcabc; }
-QPushButton#primary:disabled { background: #25544f; color: #0b1114; }
-QPushButton#accent { border-color: #2fb5a8; color: #5fd3c6; }
-QPushButton#accent:hover { background: #17302f; }
+QPushButton#primary { background: #d4a73c; color: #1a1408; border: none; font-weight: 600; padding: 9px 24px; }
+QPushButton#primary:hover { background: #e6bb54; }
+QPushButton#primary:disabled { background: #5a4a1f; color: #1a1408; }
+QPushButton#accent { border-color: #b08d3a; color: #e0b84f; }
+QPushButton#accent:hover { background: #2a2514; }
 QPushButton#accent:disabled { border-color: #212731; color: #4a5360; }
 QLineEdit, QComboBox { background: #1a1e25; border: 1px solid #2f3846; border-radius: 6px; padding: 6px; }
 QMenu { background: #1a1e25; border: 1px solid #2f3846; padding: 4px; }
@@ -50,7 +51,21 @@ QMenu::item:disabled { color: #4a5360; }
 QStatusBar { color: #6f7885; }
 """
 
-GOOD, WARN, BAD, MUTED = QColor("#5fd39a"), QColor("#f0b44c"), QColor("#ef6b6b"), QColor("#7f8896")
+LOGO = Path(__file__).resolve().parent / "assets" / "logo.svg"
+
+
+def logo_pixmap(size, dpr=1.0):
+    """Render the SVG mark crisply at `size` logical pixels."""
+    px = QPixmap(int(size * dpr), int(size * dpr))
+    px.fill(Qt.GlobalColor.transparent)
+    px.setDevicePixelRatio(dpr)
+    painter = QPainter(px)
+    QSvgRenderer(str(LOGO)).render(painter, QRectF(0, 0, size, size))
+    painter.end()
+    return px
+
+
+GOOD, WARN, BAD, MUTED = QColor("#5fd39a"), QColor("#f2994a"), QColor("#ef6b6b"), QColor("#7f8896")
 COLS = ["NAME", "VERSION", "STATUS", "WHAT CHANGED"]
 
 
@@ -292,13 +307,20 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Echo Watch")
-        self.resize(1040, 560)
+        self.resize(1160, 560)
         self.cfg = store.load()
         self.pool = QThreadPool.globalInstance()
         self.pending = 0
         self.busy = False
 
-        title = QLabel("Echo Watch")
+        icon = QIcon()
+        for sz in (16, 24, 32, 48, 64, 128, 256):
+            icon.addPixmap(logo_pixmap(sz))
+        self.setWindowIcon(icon)
+        mark = QLabel()
+        mark.setPixmap(logo_pixmap(44, self.devicePixelRatioF()))
+        mark.setFixedSize(44, 44)
+        title = QLabel('Echo <span style="color:#e0b84f;">Watch</span>')
         title.setObjectName("title")
         self.sub = QLabel("")
         self.sub.setObjectName("sub")
@@ -306,7 +328,10 @@ class Main(QMainWindow):
         self.btn_check.setObjectName("primary")
         self.btn_check.clicked.connect(self.check_all)
         head = QHBoxLayout()
+        head.setSpacing(14)
+        head.addWidget(mark)
         tcol = QVBoxLayout()
+        tcol.setSpacing(2)
         tcol.addWidget(title)
         tcol.addWidget(self.sub)
         head.addLayout(tcol)
@@ -324,10 +349,12 @@ class Main(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
+        self.table.setWordWrap(False)  # elide long values instead of wrapping
+        self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         hh = self.table.horizontalHeader()
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         hh.setHighlightSections(False)
-        for c, w in ((0, 260), (1, 200), (2, 180)):
+        for c, w in ((0, 230), (1, 410), (2, 170)):
             hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
             self.table.setColumnWidth(c, w)
         hh.setSectionResizeMode(len(COLS) - 1, QHeaderView.ResizeMode.Stretch)
@@ -401,6 +428,15 @@ class Main(QMainWindow):
         if it["kind"] == "commits" and it.get("ahead"):
             return f"{it['ahead']} new commits", WARN, False
         return "New", WARN, False
+
+    def sort_items(self):
+        """Rows that need action first (stable, so the rest keep their order)."""
+        def rank(it):
+            text = self.status(it)[0]
+            if text in ("Up to date", "Not checked"):
+                return 2
+            return 1 if text == "Check failed" else 0
+        self.items().sort(key=rank)
 
     def reload_table(self):
         self.table.setRowCount(len(self.items()))
@@ -503,6 +539,7 @@ class Main(QMainWindow):
         self.pending -= 1
         if self.pending == 0:
             self.cfg["last_check"] = time.time()
+            self.sort_items()
             self.save()
             self.reload_table()
             self.set_busy(False)
